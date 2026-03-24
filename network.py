@@ -48,18 +48,29 @@ res_dict = {"resnet18":models.resnet18, "resnet34":models.resnet34, "resnet50":m
 "resnet101":models.resnet101, "resnet152":models.resnet152, "resnext50":models.resnext50_32x4d, "resnext101":models.resnext101_32x8d}
 
 class ViT(nn.Module):
-    def __init__(self):
+    def __init__(self, use_diff_attn=False):
         super(ViT, self).__init__()
         config_vit = CONFIGS_ViT_seg['R50-ViT-B_16']
         config_vit.n_classes = 100
         config_vit.n_skip = 3
         config_vit.patches.grid = (int(224 / 16), int(224 / 16))
+        config_vit.transformer.use_diff_attn = use_diff_attn
+        self.use_diff_attn = use_diff_attn
         self.feature_extractor = ViT_seg(config_vit, img_size=[224, 224], num_classes=config_vit.n_classes)
         self.feature_extractor.load_from(weights=np.load(config_vit.pretrained_path))
         self.in_features = 2048
 
-    def forward(self, x):
-        _, feat = self.feature_extractor(x)
+    def forward(self, x, return_last_diff_gamma=False):
+        enc = self.feature_extractor.transformer.encoder
+        enc.collect_diff_gamma = bool(return_last_diff_gamma and self.use_diff_attn)
+        try:
+            _, feat, last_gamma = self.feature_extractor(x)
+        finally:
+            enc.collect_diff_gamma = False
+        if return_last_diff_gamma and self.use_diff_attn:
+            if last_gamma is None:
+                last_gamma = torch.ones(feat.size(0), device=feat.device, dtype=feat.dtype)
+            return feat, last_gamma
         return feat
 
 class ResBase(nn.Module):

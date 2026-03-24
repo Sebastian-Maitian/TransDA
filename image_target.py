@@ -139,7 +139,7 @@ def train_target(args):
     elif args.net[0:3] == 'vgg':
         netF = network.VGGBase(vgg_name=args.net).cuda()
     elif args.net == 'vit':
-        netF = network.ViT().cuda()
+        netF = network.ViT(use_diff_attn=getattr(args, 'use_diff_attn', False)).cuda()
     netB = network.feat_bootleneck(type=args.classifier, feature_dim=netF.in_features,
                                    bottleneck_dim=args.bottleneck).cuda()
     netC = network.feat_classifier(type=args.layer, class_num=args.class_num, bottleneck_dim=args.bottleneck).cuda()
@@ -159,7 +159,7 @@ def train_target(args):
     elif args.net[0:3] == 'vgg':
         netF_t = network.VGGBase(vgg_name=args.net).cuda()
     elif args.net == 'vit':
-        netF_t = network.ViT().cuda()
+        netF_t = network.ViT(use_diff_attn=getattr(args, 'use_diff_attn', False)).cuda()
     netB_t = network.feat_bootleneck(type=args.classifier, feature_dim=netF.in_features,
                                    bottleneck_dim=args.bottleneck).cuda()
     ### initial from student
@@ -207,9 +207,10 @@ def train_target(args):
             netB.eval()
             netF_t.eval()
             netB_t.eval()
-            mem_label, dd = obtain_label(dset_loaders['test'], netF_t, netB_t, netC, args)
+            mem_label, dd, mem_w = obtain_label(dset_loaders['test'], netF_t, netB_t, netC, args)
             mem_label = torch.from_numpy(mem_label).cuda()
             dd = torch.from_numpy(dd).cuda()
+            mem_w = torch.from_numpy(mem_w).float().cuda()
 
             netF.train()
             netB.train()
@@ -225,10 +226,18 @@ def train_target(args):
         if args.cls_par > 0:
             pred = mem_label[tar_idx]
             pred_soft = dd[tar_idx]
-            classifier_loss = nn.CrossEntropyLoss()(outputs_test, pred)
-            classifier_loss *= args.cls_par
+            use_pw = getattr(args, 'diff_gamma_pseudo', False) and getattr(netF, 'use_diff_attn', False)
+            if use_pw:
+                w_batch = mem_w[tar_idx]
+                ce = nn.CrossEntropyLoss(reduction='none')(outputs_test, pred)
+                classifier_loss = (ce * w_batch).sum() / (w_batch.sum() + 1e-8) * args.cls_par
+            else:
+                classifier_loss = nn.CrossEntropyLoss()(outputs_test, pred)
+                classifier_loss *= args.cls_par
             if args.kd:
-                kd_loss = KnowledgeDistillationLoss()(outputs_test, pred_soft)
+                kd_loss = KnowledgeDistillationLoss()(
+                    outputs_test, pred_soft,
+                    mask=(mem_w[tar_idx] if use_pw else None))
                 classifier_loss += kd_loss
             if iter_num < interval_iter and args.dset == "VISDA-C":
                 classifier_loss *= 0
@@ -289,6 +298,8 @@ def print_args(args):
 
 def obtain_label(loader, netF, netB, netC, args):
     start_test = True
+    use_gamma = getattr(args, 'diff_gamma_pseudo', False) and getattr(netF, 'use_diff_attn', False)
+    gamma_chunks = []
     with torch.no_grad():
         iter_test = iter(loader)
         for _ in range(len(loader)):
@@ -296,7 +307,12 @@ def obtain_label(loader, netF, netB, netC, args):
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
-            feas = netB(netF(inputs))
+            if use_gamma:
+                feat, gamma_b = netF(inputs, return_last_diff_gamma=True)
+                gamma_chunks.append(gamma_b.float().cpu())
+                feas = netB(feat)
+            else:
+                feas = netB(netF(inputs))
             outputs = netC(feas)
             if start_test:
                 all_fea = feas.float().cpu()
@@ -309,6 +325,11 @@ def obtain_label(loader, netF, netB, netC, args):
                 all_label = torch.cat((all_label, labels.float()), 0)
 
     all_output = nn.Softmax(dim=1)(all_output)
+    if use_gamma:
+        all_gamma = torch.cat(gamma_chunks, dim=0)
+        print(all_gamma.shape)
+    else:
+        all_gamma = torch.ones(all_output.size(0), dtype=torch.float32)
     # print(all_output.shape)
     # ent = torch.sum(-all_output * torch.log(all_output + args.epsilon), dim=1)
     # unknown_weight = 1 - ent / np.log(args.class_num)
@@ -326,8 +347,16 @@ def obtain_label(loader, netF, netB, netC, args):
     aff = all_output.float().cpu().numpy()
     ### aff: softmax output [bs,c]
     # print(aff.shape)
-    initc = aff.transpose().dot(all_fea)
-    initc = initc / (1e-8 + aff.sum(axis=0)[:, None])
+    if use_gamma:
+        p_max = all_output.max(dim=1).values.float().cpu().numpy()
+        gamma_np = all_gamma.numpy()
+        sample_w = (p_max * gamma_np).astype(np.float32)
+        aff_w = aff * sample_w[:, np.newaxis]
+    else:
+        sample_w = np.ones(all_output.size(0), dtype=np.float32)
+        aff_w = aff
+    initc = aff_w.transpose().dot(all_fea)
+    initc = initc / (1e-8 + aff_w.sum(axis=0)[:, None])
     # print(initc.shape)
     cls_count = np.eye(K)[predict].sum(axis=0)
     labelset = np.where(cls_count > args.threshold)
@@ -345,6 +374,8 @@ def obtain_label(loader, netF, netB, netC, args):
 
     for round in range(1):
         aff = np.eye(K)[pred_label]
+        if use_gamma:
+            aff = aff * sample_w[:, np.newaxis]
         initc = aff.transpose().dot(all_fea)
         initc = initc / (1e-8 + aff.sum(axis=0)[:, None])
         dd = cdist(all_fea, initc[labelset], args.distance)
@@ -358,7 +389,7 @@ def obtain_label(loader, netF, netB, netC, args):
     args.out_file.flush()
     print(log_str + '\n')
 
-    return pred_label.astype('int'), dd
+    return pred_label.astype('int'), dd, sample_w
 
 
 if __name__ == "__main__":
@@ -379,6 +410,9 @@ if __name__ == "__main__":
     parser.add_argument('--gent', type=bool, default=True)
     parser.add_argument('--ent', type=bool, default=True)
     parser.add_argument('--kd', type=bool, default=False)
+    parser.add_argument('--use_diff_attn', action='store_true', help='ViT backbone uses DiffAttention blocks')
+    parser.add_argument('--diff_gamma_pseudo', action='store_true',
+                        help='Pseudo-label pipeline uses w=p_max*gamma from last-layer diff attention (requires --use_diff_attn)')
     parser.add_argument('--se', type=bool, default=False)
     parser.add_argument('--nl', type=bool, default=False)
 

@@ -92,7 +92,132 @@ class Attention(nn.Module):
         context_layer = context_layer.view(*new_context_layer_shape)
         attention_output = self.out(context_layer)
         attention_output = self.proj_dropout(attention_output)
-        return attention_output, weights
+        return attention_output, weights, None
+
+
+def _repeat_kv(x, n_rep):
+    """Expand KV head groups along the head dimension (same layout as multihead_diffattn.repeat_kv)."""
+    bs, n_kv_groups, slen, width = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, None, :, :]
+        .expand(bs, n_kv_groups, n_rep, slen, width)
+        .reshape(bs, n_kv_groups * n_rep, slen, width)
+    )
+
+
+def _lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+
+try:
+    from apex.normalization import FusedRMSNorm as _DiffRMSNorm
+except ModuleNotFoundError:
+    try:
+        from rms_norm import RMSNorm as _DiffRMSNorm
+    except ModuleNotFoundError:
+
+        class _DiffRMSNorm(nn.Module):
+            def __init__(self, dim, eps=1e-5, elementwise_affine=True):
+                super().__init__()
+                self.eps = eps
+                self.weight = nn.Parameter(torch.ones(dim)) if elementwise_affine else None
+
+            def forward(self, x):
+                x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+                if self.weight is not None:
+                    x = x * self.weight
+                return x
+
+
+class DiffAttention(nn.Module):
+    """Differential attention (see multihead_diffattn.MultiheadDiffAttn), ViT-style API (no RoPE / no causal mask)."""
+
+    def __init__(self, config, vis, depth=0):
+        super(DiffAttention, self).__init__()
+        self.vis = vis
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.transformer["num_heads"]
+        num_kv_heads = config.transformer.get("num_kv_heads", None)
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else self.num_attention_heads
+        self.n_rep = self.num_attention_heads // self.num_kv_heads
+
+        self.head_dim = self.hidden_size // self.num_attention_heads // 2
+        self.scaling = self.head_dim ** -0.5
+
+        self.query = Linear(self.hidden_size, self.hidden_size)
+        self.key = Linear(self.hidden_size, self.hidden_size // self.n_rep)
+        self.value = Linear(self.hidden_size, self.hidden_size // self.n_rep)
+        self.out = Linear(self.hidden_size, self.hidden_size)
+
+        self.attn_dropout = Dropout(config.transformer["attention_dropout_rate"])
+        self.proj_dropout = Dropout(config.transformer["attention_dropout_rate"])
+
+        self.lambda_init = _lambda_init_fn(depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
+
+        self.subln = _DiffRMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+
+    def forward(self, hidden_states, return_gamma=False):
+        bsz, seq_len, _ = hidden_states.shape
+
+        q = self.query(hidden_states)
+        k = self.key(hidden_states)
+        v = self.value(hidden_states)
+
+        q = q.view(bsz, seq_len, 2 * self.num_attention_heads, self.head_dim)
+        k = k.view(bsz, seq_len, 2 * self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, seq_len, self.num_kv_heads, 2 * self.head_dim)
+
+        q = q.transpose(1, 2)
+        k = _repeat_kv(k.transpose(1, 2), self.n_rep)
+        v = _repeat_kv(v.transpose(1, 2), self.n_rep)
+        q = q * self.scaling
+
+        attn_weights = torch.matmul(q, k.transpose(-1, -2))
+        attn_weights = torch.nan_to_num(attn_weights)
+        attn_weights = Softmax(dim=-1)(attn_weights)
+
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        attn_split = attn_weights.view(bsz, self.num_attention_heads, 2, seq_len, seq_len)
+        weights = (
+            (attn_split[:, :, 0, :, :] - lambda_full * attn_split[:, :, 1, :, :])
+            if self.vis
+            else None
+        )
+        gamma = None
+        if self.vis or return_gamma:
+            a1 = attn_split[:, :, 0, :, :].mean(dim=1)
+            a2 = attn_split[:, :, 1, :, :].mean(dim=1)
+            m1 = a1.mean(dim=1)
+            m2 = a2.mean(dim=1)
+            side = int(round(seq_len ** 0.5))
+            if side * side == seq_len:
+                m1 = m1.view(bsz, side, side)
+                m2 = m2.view(bsz, side, side)
+                gamma = 1.0 - (m1 - m2).abs().mean(dim=(1, 2))
+            else:
+                gamma = 1.0 - (m1 - m2).abs().mean(dim=1)
+            gamma = gamma.clamp(0.0, 1.0)
+        attn_weights = self.attn_dropout(attn_weights)
+        attn_weights = attn_weights.view(bsz, self.num_attention_heads, 2, seq_len, seq_len)
+        attn_weights = attn_weights[:, :, 0, :, :] - lambda_full * attn_weights[:, :, 1, :, :]
+
+        context_layer = torch.matmul(attn_weights, v)
+        context_layer = self.subln(context_layer)
+        context_layer = context_layer * (1 - self.lambda_init)
+        context_layer = context_layer.transpose(1, 2).contiguous()
+        context_layer = context_layer.view(bsz, seq_len, self.num_attention_heads * 2 * self.head_dim)
+
+        attention_output = self.out(context_layer)
+        attention_output = self.proj_dropout(attention_output)
+        return attention_output, weights, gamma
 
 
 class Mlp(nn.Module):
@@ -167,25 +292,32 @@ class Embeddings(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, layer_idx=0):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn = Mlp(config)
-        self.attn = Attention(config, vis)
+        use_diff = bool(config.transformer.get("use_diff_attn", False))
+        if use_diff:
+            self.attn = DiffAttention(config, vis, depth=layer_idx)
+        else:
+            self.attn = Attention(config, vis)
 
-    def forward(self, x):
+    def forward(self, x, return_attn_gamma=False):
         h = x
         x = self.attention_norm(x)
-        x, weights = self.attn(x)
+        if isinstance(self.attn, DiffAttention):
+            x, weights, gamma = self.attn(x, return_gamma=return_attn_gamma)
+        else:
+            x, weights, gamma = self.attn(x)
         x = x + h
 
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
         x = x + h
-        return x, weights
+        return x, weights, gamma
 
     def load_from(self, weights, n_block):
         ROOT = f"Transformer/encoderblock_{n_block}"
@@ -229,20 +361,25 @@ class Encoder(nn.Module):
     def __init__(self, config, vis):
         super(Encoder, self).__init__()
         self.vis = vis
+        self.collect_diff_gamma = False
         self.layer = nn.ModuleList()
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
-        for _ in range(config.transformer["num_layers"]):
-            layer = Block(config, vis)
-            self.layer.append(copy.deepcopy(layer))
+        for i in range(config.transformer["num_layers"]):
+            self.layer.append(Block(config, vis, layer_idx=i))
 
     def forward(self, hidden_states):
         attn_weights = []
-        for layer_block in self.layer:
-            hidden_states, weights = layer_block(hidden_states)
-            if self.vis:
+        last_gamma = None
+        n_layers = len(self.layer)
+        for i, layer_block in enumerate(self.layer):
+            ra = self.collect_diff_gamma and (i == n_layers - 1)
+            hidden_states, weights, gamma = layer_block(hidden_states, return_attn_gamma=ra)
+            if self.vis and weights is not None:
                 attn_weights.append(weights)
+            if gamma is not None:
+                last_gamma = gamma
         encoded = self.encoder_norm(hidden_states)
-        return encoded, attn_weights
+        return encoded, attn_weights, last_gamma
 
 
 class Transformer(nn.Module):
@@ -253,8 +390,9 @@ class Transformer(nn.Module):
 
     def forward(self, input_ids):
         embedding_output, features = self.embeddings(input_ids)
-        encoded, attn_weights = self.encoder(embedding_output)  # (B, n_patch, hidden)
-        return encoded, attn_weights, features
+        print(last_gamma)
+        encoded, attn_weights, last_gamma = self.encoder(embedding_output)  # (B, n_patch, hidden)
+        return encoded, attn_weights, features, last_gamma
 
 
 class Conv2dReLU(nn.Sequential):
@@ -394,12 +532,12 @@ class VisionTransformer(nn.Module):
     def forward(self, x):
         if x.size()[1] == 1:
             x = x.repeat(1,3,1,1)
-        x0, attn_weights, features = self.transformer(x)  # (B, n_patch, hidden)
+        x0, attn_weights, features, last_gamma = self.transformer(x)  # (B, n_patch, hidden)
         x1 = self.decoder(x0, features)
         f=list(reversed(features))
         f.append(x1)
         f.insert(0, x)
-        return f,x1
+        return f, x1, last_gamma
 
     def load_from(self, weights):
         with torch.no_grad():
