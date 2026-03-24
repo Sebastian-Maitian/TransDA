@@ -224,12 +224,13 @@ def train_source(args):
     netB.train()
     netC.train()
 
+    iter_source = iter(dset_loaders["source_tr"])
     while iter_num < max_iter:
         try:
-            inputs_source, labels_source = iter_source.next()
-        except:
+            inputs_source, labels_source = next(iter_source)
+        except StopIteration:
             iter_source = iter(dset_loaders["source_tr"])
-            inputs_source, labels_source = iter_source.next()
+            inputs_source, labels_source = next(iter_source)
 
         if inputs_source.size(0) == 1:
             continue
