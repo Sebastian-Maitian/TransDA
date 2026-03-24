@@ -104,7 +104,7 @@ def cal_acc(loader, netF, netB, netC, flag=False):
     with torch.no_grad():
         iter_test = iter(loader)
         for i in range(len(loader)):
-            data = iter_test.next()
+            data = next(iter_test)
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
@@ -190,13 +190,14 @@ def train_target(args):
     max_iter = args.max_epoch * len(dset_loaders["target"])
     interval_iter = max_iter // args.interval
     iter_num = 0
+    iter_test = iter(dset_loaders["target"])
 
     while iter_num < max_iter:
         try:
-            inputs_test, _, tar_idx = iter_test.next()
+            inputs_test, _, tar_idx = next(iter_test)
         except:
             iter_test = iter(dset_loaders["target"])
-            inputs_test, _, tar_idx = iter_test.next()
+            inputs_test, _, tar_idx = next(iter_test)
 
         if inputs_test.size(0) == 1:
             continue
@@ -291,7 +292,7 @@ def obtain_label(loader, netF, netB, netC, args):
     with torch.no_grad():
         iter_test = iter(loader)
         for _ in range(len(loader)):
-            data = iter_test.next()
+            data = next(iter_test)
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
